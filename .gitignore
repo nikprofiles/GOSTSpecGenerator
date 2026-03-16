@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+release/
+# *.spec  # keep spec file for PyInstaller
+*.pdf
+*.exe
+.env
+.venv/
+venv/
