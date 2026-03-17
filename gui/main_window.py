@@ -3,15 +3,18 @@
 """
 
 import os
+import platform
+import subprocess
 import tempfile
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QTabWidget, QPushButton, QToolBar, QFileDialog,
     QMessageBox, QStatusBar, QSplitter, QApplication,
+    QScrollArea, QLabel,
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QPixmap, QImage
 
 from gui.settings_panel import SettingsPanel
 from gui.data_table_view import DataTableWidget
@@ -19,6 +22,7 @@ from gui.pdf_preview_widget import PdfPreviewWidget
 from core.data_model import SpecificationDocument
 from core.excel_reader import read_excel, ExcelReaderError
 from core.pdf_generator import SpecPdfGenerator
+from core.constants import APP_VERSION
 from core.autonumber import autonumber, needs_autonumber
 
 
@@ -27,7 +31,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Генератор спецификаций ГОСТ 21.110-2013")
+        self.setWindowTitle(f"Генератор спецификаций ГОСТ 21.110-2013 — v{APP_VERSION}")
         self.setMinimumSize(1000, 700)
         self._temp_pdf_path = None
         self._current_excel_path = None
@@ -35,6 +39,7 @@ class MainWindow(QMainWindow):
         self._init_menu()
         self._init_toolbar()
         self._init_statusbar()
+        self.settings_panel.load_settings()
 
     def _init_ui(self):
         # Центральный виджет
@@ -63,11 +68,20 @@ class MainWindow(QMainWindow):
         self.pdf_preview.show_message("Загрузите Excel-файл и нажмите «Предпросмотр»")
         self.tab_widget.addTab(self.pdf_preview, "Предпросмотр PDF")
 
+        # Вкладка "Справка"
+        self.tab_widget.addTab(self._create_help_tab(), "Справка")
+
         splitter.addWidget(self.tab_widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
         main_layout.addWidget(splitter)
+
+        # При смене формата/ориентации — подсказка в statusbar
+        self.settings_panel.settings_changed.connect(self._on_settings_changed)
+
+        # Lazy-загрузка изображения штампа при переключении на вкладку «Справка»
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
     def _init_menu(self):
         menubar = self.menuBar()
@@ -121,6 +135,13 @@ class MainWindow(QMainWindow):
         btn_save.clicked.connect(self._on_save_pdf)
         toolbar.addWidget(btn_save)
 
+        toolbar.addSeparator()
+
+        btn_save_settings = QPushButton("Сохранить настройки")
+        btn_save_settings.setToolTip("Сохранить текущие настройки штампа для следующего запуска")
+        btn_save_settings.clicked.connect(self._on_save_settings)
+        toolbar.addWidget(btn_save_settings)
+
     def _init_statusbar(self):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -162,10 +183,30 @@ class MainWindow(QMainWindow):
         msg = f"Загружено {len(rows)} строк из {os.path.basename(path)}"
         if warnings:
             msg += f" ({len(warnings)} предупр.)"
-            for w in warnings:
-                self.status_bar.showMessage(w, 5000)
+            QMessageBox.warning(
+                self, "Предупреждения при загрузке",
+                "\n".join(warnings),
+            )
 
         self.status_bar.showMessage(msg)
+
+    def _on_tab_changed(self, index: int):
+        """Lazy-генерация изображения штампа для вкладки «Справка»."""
+        if index == 2 and hasattr(self, '_help_stamp_generated') and not self._help_stamp_generated:
+            self._help_stamp_generated = True
+            pixmap = self._generate_help_stamp_image()
+            if pixmap and hasattr(self, '_help_stamp_label'):
+                self._help_stamp_label.setPixmap(pixmap)
+                self._help_stamp_label.setStyleSheet("border: 1px solid #ccc; background: white; padding: 5px;")
+
+    def _on_save_settings(self):
+        """Ручное сохранение настроек."""
+        self.settings_panel.save_settings()
+        self.status_bar.showMessage("Настройки сохранены", 5000)
+
+    def _on_settings_changed(self):
+        """Подсказка при смене формата/ориентации."""
+        self.status_bar.showMessage("Формат изменён. Нажмите «Предпросмотр» для обновления.", 8000)
 
     def _on_autonumber(self):
         """Ручной запуск автонумерации — быстрое обновление только позиций."""
@@ -186,6 +227,7 @@ class MainWindow(QMainWindow):
             rows=self.data_table.get_rows(),
             page_format=self.settings_panel.get_page_format(),
             orientation=self.settings_panel.get_orientation(),
+            font_name=self.settings_panel.get_font_name(),
         )
 
     def _on_preview(self):
@@ -200,7 +242,13 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
         try:
-            # Временный файл
+            # Удаляем предыдущий временный файл
+            if self._temp_pdf_path:
+                try:
+                    os.unlink(self._temp_pdf_path)
+                except OSError:
+                    pass
+
             tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
             tmp.close()
             self._temp_pdf_path = tmp.name
@@ -215,6 +263,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка генерации", str(e))
             self.status_bar.showMessage("Ошибка генерации PDF")
+            # Удаляем временный файл при ошибке
+            if self._temp_pdf_path and os.path.exists(self._temp_pdf_path):
+                try:
+                    os.unlink(self._temp_pdf_path)
+                except OSError:
+                    pass
+            self._temp_pdf_path = None
 
     def _on_save_pdf(self):
         """Сохранение PDF на диск."""
@@ -250,48 +305,166 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.Yes:
-                os.startfile(path)
+                system = platform.system()
+                if system == "Windows":
+                    os.startfile(path)
+                elif system == "Darwin":
+                    subprocess.Popen(["open", path])
+                else:
+                    subprocess.Popen(["xdg-open", path])
 
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось создать PDF:\n{e}")
+
+    def _create_help_tab(self) -> QWidget:
+        """Создаёт вкладку «Справка» с пустым штампом и горячими клавишами.
+        Изображение штампа генерируется лениво при первом показе."""
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Placeholder для изображения штампа (генерируется лениво)
+        self._help_stamp_label = QLabel("Загрузка схемы штампа...")
+        self._help_stamp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._help_stamp_generated = False
+        layout.addWidget(self._help_stamp_label)
+
+        # HTML-часть: горячие клавиши и типы строк
+        html_label = QLabel()
+        html_label.setWordWrap(True)
+        html_label.setTextFormat(Qt.TextFormat.RichText)
+        html_label.setText("""
+        <h3>Горячие клавиши</h3>
+        <table border="0" cellpadding="4" style="font-size:13px;">
+          <tr><td><b>Ctrl+O</b></td><td>Загрузить Excel-файл</td></tr>
+          <tr><td><b>Ctrl+S</b></td><td>Сохранить PDF</td></tr>
+          <tr><td><b>Ctrl+Z</b></td><td>Отменить последнее действие</td></tr>
+          <tr><td><b>Ctrl+Y</b></td><td>Повторить отменённое действие</td></tr>
+          <tr><td><b>Ctrl+C</b></td><td>Копировать выделенные ячейки</td></tr>
+          <tr><td><b>Ctrl+V</b></td><td>Вставить из буфера обмена</td></tr>
+          <tr><td><b>Ctrl+колёсико</b></td><td>Масштаб в предпросмотре PDF</td></tr>
+          <tr><td><b>ПКМ на строке</b></td><td>Контекстное меню: вставка, удаление, назначение типа</td></tr>
+        </table>
+        <br>
+        <h3>Типы строк</h3>
+        <table border="0" cellpadding="4" style="font-size:13px;">
+          <tr><td style="background:#dce6f5;padding:4px 12px;"><b>Категория</b></td>
+              <td>Жирный шрифт, голубой фон. Номер: 1, 2, 3...</td></tr>
+          <tr><td style="background:#f0f0f0;padding:4px 12px;"><i>Подкатегория</i></td>
+              <td>Курсив, серый фон. Номер: 1.1, 1.2, 2.1...</td></tr>
+          <tr><td style="padding:4px 12px;">Строка данных</td>
+              <td>Обычный шрифт. Номер: 1.1.1, 1.1.2...</td></tr>
+        </table>
+        <p style="color:#888;font-size:11px;">Назначить тип строки: ПКМ на строке → «Назначить тип»</p>
+        """)
+
+        layout.addWidget(html_label)
+        layout.addStretch()
+
+        scroll.setWidget(container)
+        return scroll
+
+    def _generate_help_stamp_image(self):
+        """Генерирует PNG только области штампа с названиями полей."""
+        try:
+            from core.data_model import StampInfo, StampRole, SpecificationDocument, PageFormat, Orientation
+            from core.pdf_generator import SpecPdfGenerator
+            from core.constants import FRAME_MARGIN_BOTTOM, STAMP_F3_HEIGHT, FRAME_MARGIN_RIGHT, STAMP_F3_WIDTH, MM
+
+            help_stamp = StampInfo(
+                designation="Обозначение документа",
+                organization="Организация / Эмблема",
+                building_name="Объект строительства",
+                sheet_title="Содержание листа",
+                user_field="Наименование листа",
+                stage="Ст.",
+                roles=[
+                    StampRole(role_name="Роль", person_name="Фамилия", date="Дата"),
+                    StampRole(role_name="Роль", person_name="Фамилия", date="Дата"),
+                    StampRole(role_name="Роль", person_name="Фамилия", date="Дата"),
+                    StampRole(role_name="Роль", person_name="Фамилия", date="Дата"),
+                    StampRole(role_name="", person_name="", date=""),
+                ],
+            )
+
+            doc = SpecificationDocument(
+                stamp=help_stamp, rows=[],
+                page_format=PageFormat.A4, orientation=Orientation.PORTRAIT,
+            )
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            tmp.close()
+            gen = SpecPdfGenerator(doc)
+            gen.generate(tmp.name)
+
+            import fitz
+            pdf_doc = fitz.open(tmp.name)
+            page = pdf_doc[0]
+
+            # Обрезаем только область штампа (нижние ~65мм страницы)
+            page_h_pt = page.rect.height
+            page_w_pt = page.rect.width
+            # Штамп: от (sx, 0) до (page_w - margin_right, stamp_h + margin_bottom) в PDF-координатах
+            # В PyMuPDF Y=0 сверху, поэтому штамп внизу
+            stamp_top_pt = page_h_pt - (STAMP_F3_HEIGHT + FRAME_MARGIN_BOTTOM + 5) * MM
+            clip = fitz.Rect(0, stamp_top_pt, page_w_pt, page_h_pt)
+
+            pix = page.get_pixmap(dpi=150, clip=clip)
+            img = QImage(pix.samples, pix.width, pix.height,
+                         pix.stride, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(img)
+            # Масштабируем до разумной ширины
+            pixmap = pixmap.scaledToWidth(min(800, pixmap.width()),
+                                          Qt.TransformationMode.SmoothTransformation)
+
+            pdf_doc.close()
+            os.unlink(tmp.name)
+            return pixmap
+        except Exception:
+            return None
 
     def _on_about(self):
         QMessageBox.about(
             self,
             "О программе",
-            "GOSTSpecGenerator v1.0.9\n"
+            f"GOSTSpecGenerator v{APP_VERSION}\n"
             "Генератор спецификаций по ГОСТ 21.110-2013\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Программа автоматически формирует PDF-документы\n"
-            "спецификаций оборудования, изделий и материалов\n"
-            "с рамками и штампами по ГОСТ 21.101.\n\n"
-            "Возможности:\n"
-            "  - Импорт данных из Excel (.xlsx)\n"
-            "  - Форматы А4, А3, А2, А1 (книжная/альбомная)\n"
-            "  - Штамп первого листа (Форма 3) и последующих (Форма 2а)\n"
-            "  - Автоопределение категорий и подкатегорий\n"
-            "  - Иерархическая автонумерация позиций\n"
-            "  - Вставка строк вручную (кнопки + ПКМ)\n"
-            "  - Настраиваемые роли с датами в штампе\n"
-            "  - Эмблема организации (PNG/JPEG)\n"
-            "  - Автосокращение длинных текстов\n"
-            "  - Округление десятичных чисел\n\n"
-            "Кому полезна:\n"
-            "  Проектировщикам, инженерам ПГС/ЭС/ОВ/ВК,\n"
-            "  студентам технических вузов — всем, кто\n"
-            "  оформляет спецификации по ГОСТ.\n\n"
+            "Программа формирует PDF-спецификации\n"
+            "оборудования и материалов с рамками\n"
+            "и штампами по ГОСТ 21.101.\n\n"
+            "Что нового (v1.0.10 -> v1.1.7):\n"
+            "  + 3-уровневая автонумерация (1 > 1.1 > 1.1.1)\n"
+            "  + Ручное назначение типа строки (ПКМ)\n"
+            "  + Сохранение настроек между сессиями\n"
+            "  + Undo/Redo (Ctrl+Z/Y)\n"
+            "  + Copy/Paste (Ctrl+C/V)\n"
+            "  + Zoom предпросмотра (Ctrl+колёсико)\n"
+            "  + Pan перемещение (зажать колёсико)\n"
+            "  + Выбор шрифта (Arial/Times/ISOCPEUR)\n"
+            "  + Вкладка Справка со схемой штампа\n"
+            "  + Tooltips на полях настроек\n"
+            "  + Кнопка сброса настроек\n"
+            "  + Исправлена ориентация A3/A2/A1\n"
+            "  + Дата в правильном столбце штампа\n"
+            "  + Фамилия по левому краю без разрыва\n"
+            "  + Рефакторинг и оптимизация кода\n\n"
+            "Для кого:\n"
+            "  Проектировщики, инженеры ПГС/ЭС/ОВ/ВК,\n"
+            "  студенты технических вузов.\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "ВНИМАНИЕ: Это черновая версия программы.\n"
-            "Она будет обязательно дорабатываться\n"
-            "и совершенствоваться в будущих обновлениях.\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "Developers: Egorov N.O., Kozlov M.S.\n"
             "Старая гвардия ППП\n\n"
             "GitHub: github.com/nikprofiles/GOSTSpecGenerator"
         )
 
     def closeEvent(self, event):
-        """Очистка временных файлов."""
+        """Сохраняем настройки и чистим временные файлы."""
+        self.settings_panel.save_settings()
         if self._temp_pdf_path and os.path.exists(self._temp_pdf_path):
             try:
                 os.unlink(self._temp_pdf_path)

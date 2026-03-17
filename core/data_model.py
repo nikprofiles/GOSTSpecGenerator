@@ -8,9 +8,9 @@ from enum import Enum
 
 class PageFormat(Enum):
     A4 = (210, 297)
-    A3 = (420, 297)
-    A2 = (594, 420)
-    A1 = (841, 594)
+    A3 = (297, 420)
+    A2 = (420, 594)
+    A1 = (594, 841)
 
 
 class Orientation(Enum):
@@ -83,6 +83,7 @@ class SpecificationDocument:
     rows: list[SpecificationRow] = field(default_factory=list)
     page_format: PageFormat = PageFormat.A4
     orientation: Orientation = Orientation.PORTRAIT
+    font_name: str = "Arial"
 
     def get_page_size_mm(self) -> tuple[float, float]:
         w, h = self.page_format.value

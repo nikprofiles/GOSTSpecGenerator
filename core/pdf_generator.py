@@ -3,6 +3,7 @@
 Поддержка категорий/подкатегорий, clipping, автоперенос.
 """
 
+import logging
 import os
 import sys
 
@@ -17,10 +18,12 @@ from core.constants import (
     LINE_WIDTH_THIN, LINE_WIDTH_INNER, CELL_PADDING, ROW_MIN_HEIGHT,
     FONT_NAME, FONT_NAME_ITALIC,
     FONT_SIZE_DATA,
+    FONT_SCALE,
+    BASELINE_OFFSET_RATIO, LINE_HEIGHT_FACTOR,
     scale_col_widths,
 )
 from core.data_model import SpecificationDocument, SpecificationRow, RowType
-from core.gost_templates import draw_frame, draw_stamp_form3, draw_stamp_form2a, draw_table_header, draw_format_label
+from core.gost_templates import draw_frame, draw_stamp_form3, draw_stamp_form2a, draw_table_header, draw_format_label, _clipped, _font
 from core.pagination import paginate, calc_row_height
 
 
@@ -36,27 +39,62 @@ class SpecPdfGenerator:
         self.doc = document
         self.page_w_mm, self.page_h_mm = document.get_page_size_mm()
         drawable_w = self.page_w_mm - FRAME_MARGIN_LEFT - FRAME_MARGIN_RIGHT
+        if drawable_w <= 0:
+            raise ValueError(
+                f"Недопустимые размеры страницы: drawable_w={drawable_w}мм "
+                f"(page_w={self.page_w_mm}, margins={FRAME_MARGIN_LEFT}+{FRAME_MARGIN_RIGHT})"
+            )
         self.col_widths = scale_col_widths(drawable_w)
+        self.total_col_width = sum(self.col_widths)
         self._fonts_registered = False
+        user_font = getattr(document, 'font_name', 'arial')
+        self.font_scale = FONT_SCALE.get(user_font, 1.0)
 
     def _register_fonts(self):
         if self._fonts_registered:
             return
 
         font_dir = _resource_path("fonts")
-        candidates = [
-            os.path.join(font_dir, "ISOCPEUR.ttf"),
-            os.path.join(font_dir, "arial.ttf"),
-            "C:/Windows/Fonts/arial.ttf",
-            "C:/Windows/Fonts/times.ttf",
-            "C:/Windows/Fonts/calibri.ttf",
-        ]
+
+        # Приоритет: шрифт выбранный пользователем → bundled → системные fallback
+        import platform
+        user_font = getattr(self.doc, 'font_name', 'arial')
+        sys_fonts = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts") \
+            if platform.system() == "Windows" else "/usr/share/fonts"
+
+        # Пользовательский выбор → конкретные TTF файлы
+        font_candidates = {
+            "arial": [
+                os.path.join(font_dir, "arial.ttf"),
+                os.path.join(sys_fonts, "arial.ttf"),
+            ],
+            "times": [
+                os.path.join(sys_fonts, "times.ttf"),
+                os.path.join(sys_fonts, "Times New Roman.ttf"),
+            ],
+            "isocpeur": [
+                os.path.join(font_dir, "ISOCPEUR.ttf"),
+                os.path.join(sys_fonts, "ISOCPEUR.ttf"),
+                os.path.join(sys_fonts, "isocpeur.ttf"),
+            ],
+        }
+
+        # Собираем: сначала preferred, потом fallback
+        candidates = font_candidates.get(user_font, [])
+        # Fallback: arial (бандлен)
+        if user_font != "arial":
+            candidates += font_candidates["arial"]
+
+        # Очищаем кэш шрифта чтобы перерегистрация сработала
+        for name in [FONT_NAME, FONT_NAME_ITALIC]:
+            if name in pdfmetrics._fonts:
+                del pdfmetrics._fonts[name]
 
         for fp in candidates:
             try:
-                if os.path.exists(fp):
-                    pdfmetrics.registerFont(TTFont(FONT_NAME, fp))
-                    break
+                pdfmetrics.registerFont(TTFont(FONT_NAME, fp))
+                logging.info(f"Шрифт зарегистрирован: {fp}")
+                break
             except Exception:
                 continue
 
@@ -65,8 +103,8 @@ class SpecPdfGenerator:
         if os.path.exists(italic_path):
             try:
                 pdfmetrics.registerFont(TTFont(FONT_NAME_ITALIC, italic_path))
-            except Exception:
-                pass
+            except (IOError, OSError, ValueError) as e:
+                logging.warning(f"Не удалось зарегистрировать italic шрифт: {e}")
 
         self._fonts_registered = True
 
@@ -101,10 +139,12 @@ class SpecPdfGenerator:
 
             if is_first:
                 draw_stamp_form3(c, self.page_w_mm, self.page_h_mm,
-                                 self.doc.stamp, sheet_num, total_sheets)
+                                 self.doc.stamp, sheet_num, total_sheets,
+                                 font_scale=self.font_scale)
             else:
                 draw_stamp_form2a(c, self.page_w_mm, self.page_h_mm,
-                                  self.doc.stamp, sheet_num, format_name)
+                                  self.doc.stamp, sheet_num, format_name,
+                                  font_scale=self.font_scale)
 
             draw_format_label(c, self.page_w_mm, self.page_h_mm, format_name)
 
@@ -123,7 +163,7 @@ class SpecPdfGenerator:
         y = y_top_mm
 
         for row in rows:
-            total_w = sum(self.col_widths)
+            total_w = self.total_col_width
 
             if row.row_type in (RowType.CATEGORY, RowType.SUBCATEGORY):
                 # Объединённая строка на всю ширину
@@ -179,29 +219,17 @@ class SpecPdfGenerator:
         font_name = self._get_font(bold=bold, italic=italic)
         font_size = FONT_SIZE_DATA + 1 if bold else FONT_SIZE_DATA
 
-        try:
-            c.setFont(font_name, font_size)
-        except KeyError:
-            c.setFont("Helvetica", font_size)
-            font_name = "Helvetica"
+        font_name = _font(c, font_size)
 
-        padding_pt = mm(CELL_PADDING + 1)  # чуть больший отступ
-        ty = mm(y_bottom_mm + h_mm / 2) - font_size * 0.35
+        padding_pt = mm(CELL_PADDING + 1)
+        ty = mm(y_bottom_mm + h_mm / 2) - font_size * BASELINE_OFFSET_RATIO
 
-        # Clipping
-        c.saveState()
-        p = c.beginPath()
-        p.rect(mm(x_mm), mm(y_bottom_mm), mm(w_mm), mm(h_mm))
-        c.clipPath(p, stroke=0)
-
-        # Имитация жирного: рисуем текст дважды с небольшим сдвигом
-        if bold and font_name == FONT_NAME:
-            c.drawString(mm(x_mm) + padding_pt, ty, text)
-            c.drawString(mm(x_mm) + padding_pt + 0.3, ty, text)  # сдвиг для "жирности"
-        else:
-            c.drawString(mm(x_mm) + padding_pt, ty, text)
-
-        c.restoreState()
+        with _clipped(c, x_mm, y_bottom_mm, w_mm, h_mm):
+            if bold and font_name == FONT_NAME:
+                c.drawString(mm(x_mm) + padding_pt, ty, text)
+                c.drawString(mm(x_mm) + padding_pt + 0.3, ty, text)
+            else:
+                c.drawString(mm(x_mm) + padding_pt, ty, text)
 
     def _draw_cell_text(self, c: Canvas, x_mm: float, y_bottom_mm: float,
                         w_mm: float, h_mm: float, text: str):
@@ -210,31 +238,21 @@ class SpecPdfGenerator:
             return
 
         font_size = FONT_SIZE_DATA
-        try:
-            c.setFont(FONT_NAME, font_size)
-        except KeyError:
-            c.setFont("Helvetica", font_size)
+        fn = _font(c, font_size)
 
         padding_pt = mm(CELL_PADDING)
         available_w = mm(w_mm) - 2 * padding_pt
         if available_w <= 0:
             return
 
-        lines = simpleSplit(text, FONT_NAME, font_size, available_w)
-        line_h = font_size * 1.2
+        lines = simpleSplit(text, fn, font_size, available_w)
+        line_h = font_size * LINE_HEIGHT_FACTOR
 
         total_text_h = len(lines) * line_h
         start_y = mm(y_bottom_mm + h_mm / 2) + total_text_h / 2 - line_h * 0.7
 
-        # Clipping — текст не выходит за ячейку
-        c.saveState()
-        p = c.beginPath()
-        p.rect(mm(x_mm), mm(y_bottom_mm), mm(w_mm), mm(h_mm))
-        c.clipPath(p, stroke=0)
-
-        for i, line in enumerate(lines):
-            tx = mm(x_mm) + padding_pt
-            ty = start_y - i * line_h
-            c.drawString(tx, ty, line)
-
-        c.restoreState()
+        with _clipped(c, x_mm, y_bottom_mm, w_mm, h_mm):
+            for i, line in enumerate(lines):
+                tx = mm(x_mm) + padding_pt
+                ty = start_y - i * line_h
+                c.drawString(tx, ty, line)

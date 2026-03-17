@@ -134,86 +134,86 @@ def read_excel(file_path: str | Path) -> tuple[list[SpecificationRow], list[str]
     except Exception as e:
         raise FileFormatError(f"Не удалось открыть файл: {e}")
 
-    ws = wb.active
-    warnings: list[str] = []
+    try:
+        ws = wb.active
+        warnings: list[str] = []
 
-    # Поиск заголовков
-    col_mapping: dict[int, str] = {}
-    header_row_idx = None
+        # Поиск заголовков
+        col_mapping: dict[int, str] = {}
+        header_row_idx = None
 
-    for row_idx, row in enumerate(ws.iter_rows(max_row=10, values_only=False), start=1):
-        mapping = {}
-        matched_fields = set()
-        for cell in row:
-            text = _cell_to_str(cell.value)
-            field_name = _match_header(text)
-            if field_name and field_name not in matched_fields:
-                mapping[cell.column - 1] = field_name
-                matched_fields.add(field_name)
+        for row_idx, row in enumerate(ws.iter_rows(max_row=10, values_only=False), start=1):
+            mapping = {}
+            matched_fields = set()
+            for cell in row:
+                text = _cell_to_str(cell.value)
+                field_name = _match_header(text)
+                if field_name and field_name not in matched_fields:
+                    mapping[cell.column - 1] = field_name
+                    matched_fields.add(field_name)
 
-        if _REQUIRED_FIELDS.issubset(matched_fields):
-            col_mapping = mapping
-            header_row_idx = row_idx
-            break
+            if _REQUIRED_FIELDS.issubset(matched_fields):
+                col_mapping = mapping
+                header_row_idx = row_idx
+                break
 
-    if header_row_idx is None:
+        if header_row_idx is None:
+            raise HeaderNotFoundError(
+                "Не найдена строка заголовков. Ожидаются колонки: "
+                "Поз., Наименование, Тип/марка, Код, Поставщик, Ед.изм., "
+                "Кол., Масса, Примечание"
+            )
+
+        rows: list[SpecificationRow] = []
+        all_rows = list(ws.iter_rows(min_row=header_row_idx + 1, values_only=True))
+        prev_type: RowType | None = None
+
+        for row_values in all_rows:
+            if not row_values or all(v is None for v in row_values):
+                continue
+
+            row_data = {}
+            for col_idx, field_name in col_mapping.items():
+                if col_idx < len(row_values):
+                    val = _cell_to_str(row_values[col_idx])
+                    # Округляем числа в числовых полях
+                    if field_name in _NUMERIC_FIELDS:
+                        val = _round_number(val)
+                    row_data[field_name] = val
+
+            # Пропускаем строки совсем без данных
+            if not any(row_data.get(f, "").strip() for f in
+                       ["position", "name", "type_brand", "product_code", "supplier",
+                        "quantity", "mass_unit_kg", "notes"]):
+                continue
+
+            # Определяем тип строки
+            row_type = _detect_row_type(row_data, prev_type)
+            prev_type = row_type
+
+            spec_row = SpecificationRow(
+                position=row_data.get("position", ""),
+                name=row_data.get("name", ""),
+                type_brand=row_data.get("type_brand", ""),
+                product_code=row_data.get("product_code", ""),
+                supplier=row_data.get("supplier", ""),
+                unit=row_data.get("unit", ""),
+                quantity=row_data.get("quantity", ""),
+                mass_unit_kg=row_data.get("mass_unit_kg", ""),
+                notes=row_data.get("notes", ""),
+                row_type=row_type,
+            )
+            rows.append(spec_row)
+
+        if not rows:
+            warnings.append("Файл не содержит строк данных после заголовков.")
+
+        found_fields = set(col_mapping.values())
+        optional_missing = {"type_brand", "product_code", "supplier", "unit",
+                            "quantity", "mass_unit_kg", "notes"} - found_fields
+        if optional_missing:
+            warnings.append(f"Не найдены колонки: {', '.join(optional_missing)}")
+
+        return rows, warnings
+    finally:
         wb.close()
-        raise HeaderNotFoundError(
-            "Не найдена строка заголовков. Ожидаются колонки: "
-            "Поз., Наименование, Тип/марка, Код, Поставщик, Ед.изм., "
-            "Кол., Масса, Примечание"
-        )
-
-    rows: list[SpecificationRow] = []
-    all_rows = list(ws.iter_rows(min_row=header_row_idx + 1, values_only=True))
-    prev_type: RowType | None = None
-
-    for row_values in all_rows:
-        if not row_values or all(v is None for v in row_values):
-            continue
-
-        row_data = {}
-        for col_idx, field_name in col_mapping.items():
-            if col_idx < len(row_values):
-                val = _cell_to_str(row_values[col_idx])
-                # Округляем числа в числовых полях
-                if field_name in _NUMERIC_FIELDS:
-                    val = _round_number(val)
-                row_data[field_name] = val
-
-        # Пропускаем строки совсем без данных
-        if not any(row_data.get(f, "").strip() for f in
-                   ["position", "name", "type_brand", "product_code", "supplier",
-                    "quantity", "mass_unit_kg", "notes"]):
-            continue
-
-        # Определяем тип строки
-        row_type = _detect_row_type(row_data, prev_type)
-        prev_type = row_type
-
-        spec_row = SpecificationRow(
-            position=row_data.get("position", ""),
-            name=row_data.get("name", ""),
-            type_brand=row_data.get("type_brand", ""),
-            product_code=row_data.get("product_code", ""),
-            supplier=row_data.get("supplier", ""),
-            unit=row_data.get("unit", ""),
-            quantity=row_data.get("quantity", ""),
-            mass_unit_kg=row_data.get("mass_unit_kg", ""),
-            notes=row_data.get("notes", ""),
-            row_type=row_type,
-        )
-        rows.append(spec_row)
-
-    wb.close()
-
-    if not rows:
-        warnings.append("Файл не содержит строк данных после заголовков.")
-
-    found_fields = set(col_mapping.values())
-    optional_missing = {"type_brand", "product_code", "supplier", "unit",
-                        "quantity", "mass_unit_kg", "notes"} - found_fields
-    if optional_missing:
-        warnings.append(f"Не найдены колонки: {', '.join(optional_missing)}")
-
-    return rows, warnings

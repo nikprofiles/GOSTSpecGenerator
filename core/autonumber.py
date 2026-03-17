@@ -1,62 +1,65 @@
 """
 Модуль автонумерации позиций спецификации.
 
-Логика:
-- Категория (CATEGORY) — НЕ нумеруется
-- Подкатегория (SUBCATEGORY) — сквозной номер: 1, 2, 3...
-  Если уже есть номер (напр. "1" из Excel) — используем его
-- Данные (DATA) — N.M где N = номер текущей подкатегории, M = счётчик
-  ВСЕГДА перенумеровываем данные внутри подкатегории
+3-уровневая иерархия:
+- Категория (CATEGORY)       → 1, 2, 3...          (жирный)
+- Подкатегория (SUBCATEGORY)  → 1.1, 1.2, 2.1...    (курсив)
+- Данные (DATA)               → 1.1.1, 1.1.2...     (обычный)
+
+Если DATA идёт без SUBCATEGORY → cat.item (1.1, 1.2...)
+Если DATA идёт без CATEGORY   → простой номер (1, 2, 3...)
 """
 
 from core.data_model import SpecificationRow, RowType
 
 
 def autonumber(rows: list[SpecificationRow]) -> list[SpecificationRow]:
-    """Автонумерация: подкатегории и данные."""
+    """Автонумерация: 3-уровневая иерархия."""
     if not rows:
         return rows
 
-    section_num = 0       # текущий номер подкатегории
-    section_label = ""    # строковое представление номера подкатегории
-    item_num = 0          # счётчик данных внутри подкатегории
-    in_section = False
+    cat_num = 0         # номер текущей категории
+    sub_num = 0         # номер текущей подкатегории внутри категории
+    item_num = 0        # номер данных внутри подкатегории
+    in_category = False
+    in_subcategory = False
 
     for row in rows:
         if row.row_type == RowType.CATEGORY:
-            in_section = False
+            cat_num += 1
+            sub_num = 0
             item_num = 0
-            # Категория — позицию не трогаем (или очищаем)
-            continue
+            in_category = True
+            in_subcategory = False
+            row.position = str(cat_num)
 
         elif row.row_type == RowType.SUBCATEGORY:
             item_num = 0
-            in_section = True
+            in_subcategory = True
 
-            if row.position.strip():
-                # У подкатегории уже есть номер из Excel — используем его
-                section_label = row.position.strip()
-                # Пытаемся извлечь числовой номер для инкремента
-                try:
-                    section_num = int(section_label.split(".")[0])
-                except ValueError:
-                    section_num += 1
+            if in_category:
+                sub_num += 1
+                row.position = f"{cat_num}.{sub_num}"
             else:
-                # Автоприсваиваем номер
-                section_num += 1
-                section_label = str(section_num)
-                row.position = section_label
-            continue
+                # Подкатегория без категории — простая нумерация
+                sub_num += 1
+                row.position = str(sub_num)
 
         elif row.row_type == RowType.DATA:
-            if in_section and section_label:
-                item_num += 1
-                row.position = f"{section_label}.{item_num}"
-            elif not row.position.strip():
-                # Нет подкатегории — простая нумерация
-                item_num += 1
+            item_num += 1
+
+            if in_subcategory and in_category:
+                # 3-уровневая: cat.sub.item
+                row.position = f"{cat_num}.{sub_num}.{item_num}"
+            elif in_category and not in_subcategory:
+                # 2-уровневая: cat.item (данные без подкатегории)
+                row.position = f"{cat_num}.{item_num}"
+            elif in_subcategory and not in_category:
+                # 2-уровневая: sub.item (подкатегория без категории)
+                row.position = f"{sub_num}.{item_num}"
+            else:
+                # Простая нумерация (без категории и подкатегории)
                 row.position = str(item_num)
-            # Если позиция есть и нет подкатегории — не трогаем
 
     return rows
 
@@ -64,6 +67,6 @@ def autonumber(rows: list[SpecificationRow]) -> list[SpecificationRow]:
 def needs_autonumber(rows: list[SpecificationRow]) -> bool:
     """Проверяет, нужна ли автонумерация."""
     return any(
-        not r.position.strip() and r.row_type in (RowType.DATA, RowType.SUBCATEGORY)
+        not r.position.strip() and r.row_type in (RowType.DATA, RowType.SUBCATEGORY, RowType.CATEGORY)
         for r in rows
     )

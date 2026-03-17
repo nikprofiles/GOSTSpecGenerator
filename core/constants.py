@@ -5,6 +5,8 @@
 
 # ── Конвертация мм → points ──────────────────────────────────────────
 
+APP_VERSION = "1.1.7"
+
 MM = 2.834645669  # 1 мм = 72 / 25.4 points
 
 
@@ -12,15 +14,6 @@ def mm(value: float) -> float:
     """Перевод миллиметров в ReportLab points."""
     return value * MM
 
-
-# ── Форматы листов (ширина, высота в мм, книжная ориентация) ─────────
-
-PAGE_FORMATS = {
-    "A4": (210, 297),
-    "A3": (420, 297),
-    "A2": (594, 420),
-    "A1": (841, 594),
-}
 
 # ── Отступы рамки (ГОСТ 21.101) ─────────────────────────────────────
 
@@ -143,6 +136,18 @@ FONT_SIZE_STAMP_LABEL = 7    # pt — подписи в штампе
 FONT_SIZE_STAMP_VALUE = 10   # pt — значения в штампе
 FONT_SIZE_STAMP_SMALL = 6    # pt — мелкий текст штампа
 
+# Коэффициенты масштабирования шрифтов (ISOCPEUR имеет меньшие глифы)
+FONT_SCALE = {
+    "arial": 1.0,
+    "times": 1.0,
+    "isocpeur": 1.3,
+}
+
+# Коэффициенты для позиционирования текста (ReportLab)
+BASELINE_OFFSET_RATIO = 0.35  # смещение базовой линии от центра ячейки
+LINE_HEIGHT_FACTOR = 1.2      # межстрочный интервал (множитель от font_size)
+TEXT_PADDING_MM = 2            # отступ текста от границ ячейки (мм)
+
 
 def drawable_area(page_w_mm: float, page_h_mm: float) -> tuple[float, float, float, float]:
     """(x, y, width, height) рабочей области внутри рамки в мм."""
@@ -175,6 +180,11 @@ def scale_col_widths(drawable_width_mm: float) -> list[float]:
 
     fixed_total = sum(BASE_COL_WIDTHS[c] for c in FIXED_WIDTH_COLS)
     expandable_total = base_total - fixed_total
+
+    # Guard: если все колонки фиксированные — возвращаем базовые ширины
+    if expandable_total == 0:
+        return [BASE_COL_WIDTHS[c] for c in COL_ORDER]
+
     extra = drawable_width_mm - base_total
     scale = (expandable_total + extra) / expandable_total
 
@@ -184,4 +194,14 @@ def scale_col_widths(drawable_width_mm: float) -> list[float]:
             result.append(BASE_COL_WIDTHS[col])
         else:
             result.append(round(BASE_COL_WIDTHS[col] * scale, 1))
+
+    # Компенсация ошибки округления: добавляем разницу к самой широкой расширяемой колонке
+    diff = drawable_width_mm - sum(result)
+    if abs(diff) > 0.01:
+        max_idx = max(
+            (i for i, c in enumerate(COL_ORDER) if c not in FIXED_WIDTH_COLS),
+            key=lambda i: result[i],
+        )
+        result[max_idx] = round(result[max_idx] + diff, 2)
+
     return result

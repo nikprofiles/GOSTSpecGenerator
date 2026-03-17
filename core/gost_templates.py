@@ -7,7 +7,10 @@
 - Заголовок таблицы спецификации (9 колонок)
 """
 
+import os
+
 from reportlab.pdfgen.canvas import Canvas
+from reportlab.lib.utils import simpleSplit
 
 from core.constants import (
     mm,
@@ -26,11 +29,26 @@ from core.constants import (
     TABLE_HEADER_HEIGHT, COL_ORDER, COL_HEADERS,
     FONT_NAME, FONT_SIZE_HEADER, FONT_SIZE_STAMP_LABEL,
     FONT_SIZE_STAMP_VALUE, FONT_SIZE_STAMP_SMALL,
+    BASELINE_OFFSET_RATIO, LINE_HEIGHT_FACTOR, TEXT_PADDING_MM,
 )
 from core.data_model import StampInfo
 
 
 # ── Утилиты ──────────────────────────────────────────────────────────
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _clipped(c: Canvas, x_mm: float, y_mm: float, w_mm: float, h_mm: float):
+    """Context manager для clipping-области на canvas."""
+    c.saveState()
+    p = c.beginPath()
+    p.rect(mm(x_mm), mm(y_mm), mm(w_mm), mm(h_mm))
+    c.clipPath(p, stroke=0)
+    yield
+    c.restoreState()
+
 
 def _lw(c: Canvas, width_mm: float):
     c.setLineWidth(mm(width_mm))
@@ -75,14 +93,9 @@ def _text_center(c: Canvas, x_mm: float, y_mm: float, w_mm: float, h_mm: float,
         text = _fit_text(c, text, w_mm - 1, font_size)
     tw = c.stringWidth(text, fn, font_size)
     tx = mm(x_mm + w_mm / 2) - tw / 2
-    ty = mm(y_mm + h_mm / 2) - font_size * 0.35
-    # Clip: не даём тексту вылезать за ячейку
-    c.saveState()
-    p = c.beginPath()
-    p.rect(mm(x_mm), mm(y_mm), mm(w_mm), mm(h_mm))
-    c.clipPath(p, stroke=0)
-    c.drawString(tx, ty, text)
-    c.restoreState()
+    ty = mm(y_mm + h_mm / 2) - font_size * BASELINE_OFFSET_RATIO
+    with _clipped(c, x_mm, y_mm, w_mm, h_mm):
+        c.drawString(tx, ty, text)
 
 
 def _text_left(c: Canvas, x_mm: float, y_mm: float, w_mm: float, h_mm: float,
@@ -95,13 +108,9 @@ def _text_left(c: Canvas, x_mm: float, y_mm: float, w_mm: float, h_mm: float,
     if auto_fit:
         text = _fit_text(c, text, w_mm - pad_mm - 0.5, font_size)
     tx = mm(x_mm + pad_mm)
-    ty = mm(y_mm + h_mm / 2) - font_size * 0.35
-    c.saveState()
-    p = c.beginPath()
-    p.rect(mm(x_mm), mm(y_mm), mm(w_mm), mm(h_mm))
-    c.clipPath(p, stroke=0)
-    c.drawString(tx, ty, text)
-    c.restoreState()
+    ty = mm(y_mm + h_mm / 2) - font_size * BASELINE_OFFSET_RATIO
+    with _clipped(c, x_mm, y_mm, w_mm, h_mm):
+        c.drawString(tx, ty, text)
 
 
 def _text_multiline_center(c: Canvas, x_mm: float, y_mm: float, w_mm: float, h_mm: float,
@@ -115,7 +124,6 @@ def _text_multiline_center(c: Canvas, x_mm: float, y_mm: float, w_mm: float, h_m
     max_h_pt = mm(h_mm - 1)  # доступная высота
 
     # Авто-перенос по словам: разбиваем длинные строки
-    from reportlab.lib.utils import simpleSplit
 
     # Автомасштабирование: уменьшаем шрифт пока текст не влезет
     current_size = font_size
@@ -128,7 +136,7 @@ def _text_multiline_center(c: Canvas, x_mm: float, y_mm: float, w_mm: float, h_m
             split = simpleSplit(raw, fn, current_size, max_w_pt)
             all_lines.extend(split if split else [""])
 
-        line_h = current_size * 1.2
+        line_h = current_size * LINE_HEIGHT_FACTOR
         total_h = len(all_lines) * line_h
 
         if total_h <= max_h_pt or not auto_scale:
@@ -136,23 +144,16 @@ def _text_multiline_center(c: Canvas, x_mm: float, y_mm: float, w_mm: float, h_m
         current_size -= 0.5
 
     fn = _font(c, current_size)
-    line_h = current_size * 1.2
+    line_h = current_size * LINE_HEIGHT_FACTOR
     total = len(all_lines) * line_h
     start_y = mm(y_mm + h_mm / 2) + total / 2 - line_h * 0.7
 
-    # Clipping
-    c.saveState()
-    p = c.beginPath()
-    p.rect(mm(x_mm), mm(y_mm), mm(w_mm), mm(h_mm))
-    c.clipPath(p, stroke=0)
-
-    for i, line in enumerate(all_lines):
-        tw = c.stringWidth(line, fn, current_size)
-        tx = mm(x_mm + w_mm / 2) - tw / 2
-        ty = start_y - i * line_h
-        c.drawString(tx, ty, line)
-
-    c.restoreState()
+    with _clipped(c, x_mm, y_mm, w_mm, h_mm):
+        for i, line in enumerate(all_lines):
+            tw = c.stringWidth(line, fn, current_size)
+            tx = mm(x_mm + w_mm / 2) - tw / 2
+            ty = start_y - i * line_h
+            c.drawString(tx, ty, line)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -201,9 +202,11 @@ def draw_format_label(c: Canvas, page_w_mm: float, page_h_mm: float, format_name
 # ══════════════════════════════════════════════════════════════════════
 
 def draw_stamp_form3(c: Canvas, page_w_mm: float, page_h_mm: float,
-                     stamp: StampInfo, sheet_num: int = 1, total_sheets: int = 1):
+                     stamp: StampInfo, sheet_num: int = 1, total_sheets: int = 1,
+                     font_scale: float = 1.0):
     """Штамп первого листа (185×55мм)."""
-    import os
+    # Масштабирование шрифтов (для ISOCPEUR увеличиваем)
+    def fs(size): return size * font_scale
 
     sx = page_w_mm - FRAME_MARGIN_RIGHT - STAMP_F3_WIDTH
     sy = FRAME_MARGIN_BOTTOM
@@ -243,8 +246,8 @@ def draw_stamp_form3(c: Canvas, page_w_mm: float, page_h_mm: float,
 
     # ══ ЛЕВЫЙ БЛОК (65мм × 55мм) ══
     # Снизу вверх:
-    #   Строка 0 (sy → sy+5): Labels "Изм./Кол.уч./Лист/№док./Подп./Дата"
-    #   Строки 1-5 (sy+5 → sy+30): Роли (Разраб./Пров./Н.контр./Утв./пусто)
+    #   Строки 0-4 (sy → sy+25): Роли (Разраб./Пров./Н.контр./Утв./пусто)
+    #   Строка 5 (sy+25 → sy+30): Labels "Изм./Кол.уч./Лист/№док./Подп./Дата"
     #   Строки 6-10 (sy+30 → sy+55): Пустые строки с 6 колонками (табл. изменений)
     # Всего 11 строк × 5мм = 55мм — заполняет ВСЮ высоту штампа
 
@@ -261,12 +264,13 @@ def draw_stamp_form3(c: Canvas, page_w_mm: float, page_h_mm: float,
         ry = sy + rh * i
         c.line(mm(sx), mm(ry), mm(left_right_x), mm(ry))
 
-    # ── Вертикальные колонки 6шт в зоне labels + изменений (от sy до roles_top_y) ──
+    # ── Вертикальные колонки 6шт ТОЛЬКО в строке labels (1 строка, 5мм) ──
+    labels_y = roles_top_y - rh  # sy + 25
     cx = sx
     for i, col_w in enumerate(STAMP_F3_LEFT_COLS):
         cx += col_w
         if i < len(STAMP_F3_LEFT_COLS) - 1:
-            c.line(mm(cx), mm(sy), mm(cx), mm(roles_top_y))
+            c.line(mm(cx), mm(labels_y), mm(cx), mm(roles_top_y))
 
     # ── Также 6 колонок продолжаются ВВЕРХ от roles_top_y до top_y ──
     cx = sx
@@ -275,72 +279,82 @@ def draw_stamp_form3(c: Canvas, page_w_mm: float, page_h_mm: float,
         if i < len(STAMP_F3_LEFT_COLS) - 1:
             c.line(mm(cx), mm(roles_top_y), mm(cx), mm(top_y))
 
-    # ── Вертикальные линии в зоне ролей: роль(10) | фамилия(20) | дата(35) ──
-    role_col1_x = sx + STAMP_F3_LEFT_COLS[0]
-    role_col2_x = role_col1_x + STAMP_F3_LEFT_COLS[1] + STAMP_F3_LEFT_COLS[2]
+    # ── Вертикальные линии в зоне ролей: роль(10) | фамилия(20, cols 2+3) | №док(10) | подп(15) | дата(10) ──
+    role_col1_x = sx + STAMP_F3_LEFT_COLS[0]                              # sx+10  (после роли)
+    role_col2_x = role_col1_x + STAMP_F3_LEFT_COLS[1] + STAMP_F3_LEFT_COLS[2]  # sx+30  (после фамилии)
+    role_col3_x = role_col2_x + STAMP_F3_LEFT_COLS[3]                     # sx+40  (после №док)
+    role_col4_x = role_col3_x + STAMP_F3_LEFT_COLS[4]                     # sx+55  (после подп)
+    # col 6 (дата): sx+55 → sx+65
 
-    c.line(mm(role_col1_x), mm(sy + rh), mm(role_col1_x), mm(roles_top_y))
-    c.line(mm(role_col2_x), mm(sy + rh), mm(role_col2_x), mm(roles_top_y))
+    # Вертикальные линии ролей только до строки labels (не включая её)
+    labels_y_line = roles_top_y - rh  # sy + 25
+    c.line(mm(role_col1_x), mm(sy), mm(role_col1_x), mm(labels_y_line))
+    c.line(mm(role_col2_x), mm(sy), mm(role_col2_x), mm(labels_y_line))
+    c.line(mm(role_col3_x), mm(sy), mm(role_col3_x), mm(labels_y_line))
+    c.line(mm(role_col4_x), mm(sy), mm(role_col4_x), mm(labels_y_line))
 
     # ══ ТЕКСТ ══
 
     # Labels: Изм., Кол.уч., Лист, № док., Подп., Дата
+    # Верхняя строка блока (над ролями): roles_top_y - rh → roles_top_y
+    labels_y = roles_top_y - rh  # sy + 25
     cx = sx
     for i, label in enumerate(STAMP_F3_LEFT_LABELS):
         w = STAMP_F3_LEFT_COLS[i]
-        _text_center(c, cx, sy, w, rh, label, FONT_SIZE_STAMP_SMALL)
+        _text_center(c, cx, labels_y, w, rh, label, fs(FONT_SIZE_STAMP_SMALL))
         cx += w
 
-    # Роли + фамилии + даты (строки 1-5, от sy+5 до sy+30)
+    # Роли + фамилии + даты (строки 0-4, от sy до sy+25)
     for i, role in enumerate(stamp.roles):
         if i >= STAMP_F3_ROLE_ROWS:
             break
-        row_y = sy + rh * (i + 1)  # строка 1 = sy+5, строка 5 = sy+25
+        row_y = sy + rh * i  # строка 0 = sy, строка 4 = sy+20
         # Роль (10мм)
         _text_left(c, sx, row_y, STAMP_F3_LEFT_COLS[0], rh,
-                   role.role_name, FONT_SIZE_STAMP_SMALL, pad_mm=0.5, auto_fit=True)
-        # Фамилия (20мм)
+                   role.role_name, fs(FONT_SIZE_STAMP_SMALL), pad_mm=0.5, auto_fit=True)
+        # Фамилия (20мм = cols 2+3 объединены, выравнивание по левому краю)
         name_w = STAMP_F3_LEFT_COLS[1] + STAMP_F3_LEFT_COLS[2]
-        _text_center(c, role_col1_x, row_y, name_w, rh,
-                     role.person_name, FONT_SIZE_STAMP_SMALL, auto_fit=True)
-        # Дата (35мм оставшихся = 65-30)
-        date_w = STAMP_F3_LEFT_W - STAMP_F3_LEFT_COLS[0] - name_w
-        _text_center(c, role_col2_x, row_y, date_w, rh,
-                     role.date, FONT_SIZE_STAMP_SMALL, auto_fit=True)
+        _text_left(c, role_col1_x, row_y, name_w, rh,
+                   role.person_name, fs(FONT_SIZE_STAMP_SMALL), pad_mm=0.5, auto_fit=True)
+        # Дата — только col 6 (10мм), cols 4 и 5 пустые (для подписей на бумаге)
+        date_col_x = role_col4_x  # sx + 55
+        date_w = STAMP_F3_LEFT_COLS[5]  # 10мм
+        _text_center(c, date_col_x, row_y, date_w, rh,
+                     role.date, fs(FONT_SIZE_STAMP_SMALL), auto_fit=True)
 
     # Правый блок: тексты
     # (1) Обозначение
     _text_center(c, left_right_x, y1, STAMP_F3_RIGHT_W, STAMP_F3_AREA1_H,
-                 stamp.designation, FONT_SIZE_STAMP_VALUE + 2, auto_fit=True)
+                 stamp.designation, fs(FONT_SIZE_STAMP_VALUE + 2), auto_fit=True)
 
     # (2) Объект (название здания)
     _text_multiline_center(c, left_right_x, y2, STAMP_F3_RIGHT_W, STAMP_F3_AREA2_H,
-                            stamp.building_name, FONT_SIZE_STAMP_VALUE, auto_fit=True)
+                            stamp.building_name, fs(FONT_SIZE_STAMP_VALUE), auto_fit=True)
 
     # (3) Содержание листа (левая часть)
     obj_w = STAMP_F3_RIGHT_W - STAMP_F3_BOTTOM_RIGHT_W
     _text_multiline_center(c, left_right_x, y3, obj_w, STAMP_F3_AREA3_H,
-                            stamp.sheet_title, FONT_SIZE_STAMP_VALUE, auto_fit=True)
+                            stamp.sheet_title, fs(FONT_SIZE_STAMP_VALUE), auto_fit=True)
 
     # Стадия/Лист/Листов labels
     _text_center(c, br_x, label3_y, STAMP_F3_STAGE_W, y2 - label3_y,
-                 "Стадия", FONT_SIZE_STAMP_SMALL)
+                 "Стадия", fs(FONT_SIZE_STAMP_SMALL))
     _text_center(c, stage_x, label3_y, STAMP_F3_SHEET_W, y2 - label3_y,
-                 "Лист", FONT_SIZE_STAMP_SMALL)
+                 "Лист", fs(FONT_SIZE_STAMP_SMALL))
     _text_center(c, sheet_x, label3_y, STAMP_F3_SHEETS_TOTAL_W, y2 - label3_y,
-                 "Листов", FONT_SIZE_STAMP_SMALL)
+                 "Листов", fs(FONT_SIZE_STAMP_SMALL))
 
     # Стадия/Лист/Листов values
     _text_center(c, br_x, y3, STAMP_F3_STAGE_W, 5,
-                 stamp.stage, FONT_SIZE_STAMP_VALUE)
+                 stamp.stage, fs(FONT_SIZE_STAMP_VALUE))
     _text_center(c, stage_x, y3, STAMP_F3_SHEET_W, 5,
-                 str(sheet_num), FONT_SIZE_STAMP_VALUE)
+                 str(sheet_num), fs(FONT_SIZE_STAMP_VALUE))
     _text_center(c, sheet_x, y3, STAMP_F3_SHEETS_TOTAL_W, 5,
-                 str(total_sheets), FONT_SIZE_STAMP_VALUE)
+                 str(total_sheets), fs(FONT_SIZE_STAMP_VALUE))
 
     # (4) Доп. поле — нижняя ЛЕВАЯ (70мм)
     _text_multiline_center(c, left_right_x, sy, obj_w, STAMP_F3_AREA4_H,
-                            stamp.user_field, FONT_SIZE_STAMP_VALUE, auto_fit=True)
+                            stamp.user_field, fs(FONT_SIZE_STAMP_VALUE), auto_fit=True)
 
     # Организация / Эмблема — нижняя ПРАВАЯ (50мм)
     if stamp.use_emblem and stamp.emblem_path and os.path.exists(stamp.emblem_path):
@@ -361,13 +375,15 @@ def draw_stamp_form3(c: Canvas, page_w_mm: float, page_h_mm: float,
             img_y = mm(sy + 1) + (max_h - draw_h) / 2
             c.drawImage(stamp.emblem_path, img_x, img_y, draw_w, draw_h,
                         preserveAspectRatio=True, mask='auto')
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.warning(f"Не удалось загрузить эмблему '{stamp.emblem_path}': {e}")
             # Fallback: текст организации
             _text_multiline_center(c, br_x, sy, STAMP_F3_BOTTOM_RIGHT_W, STAMP_F3_AREA4_H,
-                                    stamp.organization, FONT_SIZE_STAMP_VALUE - 1, auto_fit=True)
+                                    stamp.organization, fs(FONT_SIZE_STAMP_VALUE - 1), auto_fit=True)
     else:
         _text_multiline_center(c, br_x, sy, STAMP_F3_BOTTOM_RIGHT_W, STAMP_F3_AREA4_H,
-                                stamp.organization, FONT_SIZE_STAMP_VALUE - 1, auto_fit=True)
+                                stamp.organization, fs(FONT_SIZE_STAMP_VALUE - 1), auto_fit=True)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -378,8 +394,10 @@ def draw_stamp_form3(c: Canvas, page_w_mm: float, page_h_mm: float,
 # ══════════════════════════════════════════════════════════════════════
 
 def draw_stamp_form2a(c: Canvas, page_w_mm: float, page_h_mm: float,
-                      stamp: StampInfo, sheet_num: int, format_name: str = ""):
+                      stamp: StampInfo, sheet_num: int, format_name: str = "",
+                      font_scale: float = 1.0):
     """Штамп последующих листов (185×15мм)."""
+    def fs(size): return size * font_scale
 
     sx = page_w_mm - FRAME_MARGIN_RIGHT - STAMP_F2A_WIDTH
     sy = FRAME_MARGIN_BOTTOM
@@ -417,25 +435,26 @@ def draw_stamp_form2a(c: Canvas, page_w_mm: float, page_h_mm: float,
 
     # ══ ТЕКСТ ══
 
-    # Заголовки левого блока
+    # Заголовки левого блока — верхняя строка (над пустыми строками)
+    labels_2a_y = sy + STAMP_F2A_HEIGHT - STAMP_F2A_ROW_H  # верхняя строка
     cx = sx
     for i, label in enumerate(STAMP_F2A_LEFT_LABELS):
         w = STAMP_F2A_LEFT_COLS[i]
-        _text_center(c, cx, sy, w, STAMP_F2A_ROW_H, label, FONT_SIZE_STAMP_SMALL)
+        _text_center(c, cx, labels_2a_y, w, STAMP_F2A_ROW_H, label, fs(FONT_SIZE_STAMP_SMALL))
         cx += w
 
     # Обозначение — большая центральная зона
     desig_w = edge_x - left_right_x
     _text_center(c, left_right_x, sy, desig_w, STAMP_F2A_HEIGHT,
-                 stamp.designation, FONT_SIZE_STAMP_VALUE, auto_fit=True)
+                 stamp.designation, fs(FONT_SIZE_STAMP_VALUE), auto_fit=True)
 
     # Правая ячейка верх: "Лист" label
     _text_center(c, edge_x, split_y, STAMP_F2A_RIGHT_EDGE_W, STAMP_F2A_SHEET_H,
-                 "Лист", FONT_SIZE_STAMP_SMALL)
+                 "Лист", fs(FONT_SIZE_STAMP_SMALL))
 
     # Правая ячейка низ: номер листа
     _text_center(c, edge_x, sy, STAMP_F2A_RIGHT_EDGE_W, STAMP_F2A_FORMAT_H,
-                 str(sheet_num), FONT_SIZE_STAMP_VALUE)
+                 str(sheet_num), fs(FONT_SIZE_STAMP_VALUE))
 
 
 # ══════════════════════════════════════════════════════════════════════
